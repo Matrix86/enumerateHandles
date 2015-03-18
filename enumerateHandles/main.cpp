@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <Windows.h>
 #include <Subauth.h>
+#include "Psapi.h"
 
 #define STATUS_INFO_LENGTH_MISMATCH 0xc0000004
 
@@ -99,7 +100,7 @@ OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
 typedef struct _THREAD_CONTEXT
 {
 	HANDLE hDup;
-	HANDLE hEvent;
+	char   szFileName[MAX_PATH];
 }
 THREAD_CONTEXT, *PTHREAD_CONTEXT;
 
@@ -223,25 +224,88 @@ DWORD WINAPI GetObjectNameThread( LPVOID lpParam )
 		return -1;
 	}
 
-	/* Cast our buffer into an UNICODE_STRING. */
 	objectName = *(PUNICODE_STRING)objectNameInfo;
 
-	/* Print the information! */
 	if( 
 		objectName.Length /*&&
 		wcsncmp( pObjectTypeInfo->Name.Buffer, L"handles.c", pObjectTypeInfo->Name.Length / 2 ) == 0*/
 	)
 	{
-		/* The object has a name. */
-		printf(
+		wcstombs( pCtx->szFileName, objectName.Buffer, MAX_PATH - 1 );
+
+		/*printf(
 			"%wZ\n",
 			&objectName
-		);
+		);*/
 	}
 
 	free( objectNameInfo );
 
 	return 0;
+}
+
+inline void CanonicalizeNtPathName( char *szNtPathName, char *szCanonicalized )
+{
+	char  szNtDriveName[MAX_PATH + 1] = {0};
+	DWORD dwDrivesMask;
+
+	strncpy( szCanonicalized, szNtPathName, MAX_PATH );
+	CharLower( szCanonicalized );
+
+	// Get the bit mask of drive letters
+	dwDrivesMask = ::GetLogicalDrives();
+
+	if( dwDrivesMask )
+	{
+		// Go through all possible letters from a to z
+		for( int i = 0; i < 26; ++i )
+		{
+			// Check if the respective bit is set
+			if( dwDrivesMask & (1 << i) )
+			{
+				char szDrive[10] = {0};
+
+				sprintf( szDrive, "%c:", 'A' + i );
+
+				// obtain nt drive name from logical drive name
+				if( QueryDosDevice( szDrive, szNtDriveName, MAX_PATH ) != 0 )
+				{
+					CharLower( szNtDriveName );
+
+					// found it
+					if( strstr( szCanonicalized, szNtDriveName ) )
+					{
+						sprintf( szCanonicalized, "%s%s", szDrive, &szNtPathName[ strlen( szNtDriveName ) ] ); 
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	if( szCanonicalized[0] == '\\' )
+	{
+		char szTmp[MAX_PATH + 1] = { 0 },
+				szWindowsDir[MAX_PATH + 1] = {0};
+
+		strncpy( szTmp, szCanonicalized, MAX_PATH );
+
+		GetWindowsDirectory( szWindowsDir, MAX_PATH );
+
+		sprintf( szCanonicalized, "%c:%s", szWindowsDir[0], szTmp );
+	}
+
+}
+
+BOOLEAN GetProcessName( DWORD processID, char *szName )
+{ 
+	BOOLEAN bResult;
+
+	HANDLE hProcess = OpenProcess( PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processID );
+
+	bResult = GetProcessImageFileName( hProcess, szName, MAX_PATH ) != 0;
+
+	return bResult;
 }
 
 void main( int argc, char **argv )
@@ -255,7 +319,7 @@ void main( int argc, char **argv )
 
 	SetDebugPrivilege(TRUE);
 
-	SystemHandleInfo = (SYSTEM_HANDLE_INFORMATION *)malloc(SystemInfoLength);
+	SystemHandleInfo = (PSYSTEM_HANDLE_INFORMATION)VirtualAlloc( NULL, SystemInfoLength, MEM_COMMIT, PAGE_READWRITE );
 	if( SystemHandleInfo == NULL )
 	{
 		printf( "[ERROR] : can't allocate memory\n" );
@@ -280,8 +344,10 @@ void main( int argc, char **argv )
 		) == STATUS_INFO_LENGTH_MISMATCH
 	)
 	{
+		VirtualFree( SystemHandleInfo, SystemInfoLength, MEM_RELEASE );
+
 		SystemInfoLength *= 2;
-		SystemHandleInfo  = (SYSTEM_HANDLE_INFORMATION *)realloc( SystemHandleInfo, SystemInfoLength );
+		SystemHandleInfo = (PSYSTEM_HANDLE_INFORMATION)VirtualAlloc( NULL, SystemInfoLength, MEM_COMMIT, PAGE_READWRITE );
 		if( SystemHandleInfo == NULL )
 		{
 			printf( "[ERROR] : can't reallocate memory\n" );
@@ -306,6 +372,8 @@ void main( int argc, char **argv )
 		DWORD  dwThread, dwWaitObject;
 		HANDLE dupHandle = NULL;
 
+		char szNTProcessName[MAX_PATH +1] = {0};
+
 		SYSTEM_HANDLE SystemHandle = SystemHandleInfo->Handles[i];
 		ULONG         ProcessId    =  SystemHandle.ProcessId;
 
@@ -316,28 +384,32 @@ void main( int argc, char **argv )
 		//
 		// This handle is a named pipe!
 		//
-		if( SystemHandle.GrantedAccess == 0x0012019f )
+		/*if( SystemHandle.GrantedAccess == 0x0012019f )
 		{
 			continue;
-		}
+		}*/
 
-		hProcess = OpenProcess( PROCESS_DUP_HANDLE, FALSE, ProcessId );
+		GetProcessName( ProcessId, szNTProcessName );
+
+		hProcess = OpenProcess( PROCESS_DUP_HANDLE, TRUE, ProcessId );
 		if( hProcess )
 		{
-			status = 
-				NtDuplicateObject(
-					hProcess,
-					(HANDLE)SystemHandle.Handle,
-					GetCurrentProcess(),
-					&dupHandle,
-					0,
-					0,
-					0
-				);
+			status = DuplicateHandle( hProcess, (HANDLE)SystemHandle.Handle, GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS );
+
+			//status = 
+			//	NtDuplicateObject(
+			//		hProcess,
+			//		(HANDLE)SystemHandle.Handle,
+			//		GetCurrentProcess(),
+			//		&dupHandle,
+			//		0,
+			//		0,
+			//		0
+			//	);
 
 			if( !NT_SUCCESS(status) )
 			{
-				printf( "[ERROR] : NtDuplicateObject fails : 0x%08X\n", status );
+				printf( "[ERROR] : DuplicateHandle fails : 0x%08X\n", status );
 
 				goto exitLoop;
 			}
@@ -377,6 +449,7 @@ void main( int argc, char **argv )
 			PTHREAD_CONTEXT pThreadCtx = (PTHREAD_CONTEXT)HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(THREAD_CONTEXT) );
 
 			pThreadCtx->hDup = dupHandle;
+			ZeroMemory( pThreadCtx->szFileName, MAX_PATH );
 
 			HANDLE hThread =
 				CreateThread( 
@@ -388,10 +461,22 @@ void main( int argc, char **argv )
 					&dwThread
 				);
 
-			dwWaitObject = WaitForSingleObject( hThread, 500 );
+			dwWaitObject = WaitForSingleObject( hThread, 50 );
 
 			if( dwWaitObject == WAIT_TIMEOUT )
+			{
 				TerminateThread( hThread, 0 );
+			}
+			else
+			{
+				char szFileName[MAX_PATH]    = {0},
+					 szProcessName[MAX_PATH] = {0};
+
+				CanonicalizeNtPathName( pThreadCtx->szFileName, szFileName );
+				CanonicalizeNtPathName( szNTProcessName, szProcessName );
+
+				printf( "File : %s Pid : %d (%s)\n", szFileName, ProcessId, szProcessName );
+			}
 
 			CloseHandle(hThread);
 
@@ -417,7 +502,7 @@ exitLoop:
 end:
 	if( SystemHandleInfo != NULL )
 	{
-		free(SystemHandleInfo);
+		VirtualFree( SystemHandleInfo, SystemInfoLength, MEM_RELEASE );
 	}
 
 	return;
