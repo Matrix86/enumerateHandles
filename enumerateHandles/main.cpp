@@ -3,6 +3,10 @@
 #include <Subauth.h>
 #include "Psapi.h"
 
+#include <vector>
+
+using namespace std;
+
 #define STATUS_INFO_LENGTH_MISMATCH 0xc0000004
 
 #define SystemHandleInformation     0x10
@@ -104,6 +108,15 @@ typedef struct _THREAD_CONTEXT
 }
 THREAD_CONTEXT, *PTHREAD_CONTEXT;
 
+typedef struct
+{
+	char   szFileName[MAX_PATH];
+	char   szProcessName[MAX_PATH];
+	HANDLE FileHandle;
+	ULONG  ProcessId;
+}
+HANDLE_INFO, *PHANDLE_INFO;
+
 _NtQuerySystemInformation NtQuerySystemInformation = (_NtQuerySystemInformation)GetProcAddress( GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation" );
 _NtDuplicateObject        NtDuplicateObject        = (_NtDuplicateObject)GetProcAddress( GetModuleHandleA("ntdll.dll"), "NtDuplicateObject" );
 _NtQueryObject            NtQueryObject            = (_NtQueryObject)GetProcAddress( GetModuleHandleA("ntdll.dll"), "NtQueryObject" );
@@ -201,7 +214,7 @@ DWORD WINAPI GetObjectNameThread( LPVOID lpParam )
 	objectNameInfo = malloc(0x1000);
 	if( objectNameInfo == NULL )
 	{
-		printf( "[ERROR] : can't allocate memory : 0x%08X\n", GetLastError() );
+		//printf( "[ERROR] : can't allocate memory : 0x%08X\n", GetLastError() );
 
 		return -1;
 	}
@@ -217,7 +230,7 @@ DWORD WINAPI GetObjectNameThread( LPVOID lpParam )
 
 	if( !NT_SUCCESS(status) )
 	{
-		printf( "[ERROR] : NtQueryObject fails : 0x%08X\n", status );
+		//printf( "[ERROR] : NtQueryObject fails : 0x%08X\n", status );
 
 		free( objectNameInfo );
 
@@ -308,7 +321,7 @@ BOOLEAN GetProcessName( DWORD processID, char *szName )
 	return bResult;
 }
 
-void main( int argc, char **argv )
+void GetSystemHandles( vector<HANDLE_INFO> &HandlesList )
 {
 	NTSTATUS status;
 	HANDLE   hProcess = NULL;
@@ -317,17 +330,13 @@ void main( int argc, char **argv )
 	SYSTEM_HANDLE_INFORMATION *SystemHandleInfo;
 	ULONG SystemInfoLength = sizeof(SYSTEM_HANDLE_INFORMATION) + ( sizeof(SYSTEM_HANDLE) * 100 );
 
-	SetDebugPrivilege(TRUE);
-
 	SystemHandleInfo = (PSYSTEM_HANDLE_INFORMATION)VirtualAlloc( NULL, SystemInfoLength, MEM_COMMIT, PAGE_READWRITE );
 	if( SystemHandleInfo == NULL )
 	{
-		printf( "[ERROR] : can't allocate memory\n" );
+		//printf( "[ERROR] : can't allocate memory\n" );
 
 		goto end;
 	}
-
-	printf( "# Gathering all handles information.\n" );
 
 	//
 	// If the buffer lenght is too small, NtQuerySystemInformation return STATUS_INFO_LENGTH_MISMATCH as error,
@@ -350,7 +359,7 @@ void main( int argc, char **argv )
 		SystemHandleInfo = (PSYSTEM_HANDLE_INFORMATION)VirtualAlloc( NULL, SystemInfoLength, MEM_COMMIT, PAGE_READWRITE );
 		if( SystemHandleInfo == NULL )
 		{
-			printf( "[ERROR] : can't reallocate memory\n" );
+			//printf( "[ERROR] : can't reallocate memory\n" );
 
 			goto end;
 		}
@@ -358,12 +367,12 @@ void main( int argc, char **argv )
 	
 	if( !NT_SUCCESS(status) )
 	{
-		printf( "[ERROR] : NtQuerySystemInformation fails!\n" );
+		//printf( "[ERROR] : NtQuerySystemInformation fails!\n" );
 		
 		goto end;
 	}
 
-	printf( "# Enumerating %d handles.\n", SystemHandleInfo->HandleCount );
+	//printf( "# Enumerating %d handles.\n", SystemHandleInfo->HandleCount );
 
 	for( unsigned int i = 0; i < SystemHandleInfo->HandleCount; i++ )
 	{
@@ -409,7 +418,7 @@ void main( int argc, char **argv )
 
 			if( !NT_SUCCESS(status) )
 			{
-				printf( "[ERROR] : DuplicateHandle fails : 0x%08X\n", status );
+				//printf( "[ERROR] : DuplicateHandle fails : 0x%08X\n", status );
 
 				goto exitLoop;
 			}
@@ -417,7 +426,7 @@ void main( int argc, char **argv )
 			pObjectTypeInfo = (OBJECT_TYPE_INFORMATION *)malloc(0x1000);
 			if( pObjectTypeInfo == NULL )
 			{
-				printf( "[ERROR] : can't allocate memory for pObjectTypeInfo.\n" );
+				//printf( "[ERROR] : can't allocate memory for pObjectTypeInfo.\n" );
 
 				goto exitLoop;
 			}
@@ -433,7 +442,7 @@ void main( int argc, char **argv )
 
 			if( !NT_SUCCESS(status) )
 			{
-				printf( "[ERROR] : NtQueryObject fails : 0x%08X\n", status );
+				//printf( "[ERROR] : NtQueryObject fails : 0x%08X\n", status );
 
 				goto exitLoop;
 			}
@@ -469,13 +478,22 @@ void main( int argc, char **argv )
 			}
 			else
 			{
+				HANDLE_INFO hInfo;
+
+				//ZeroMemory( hInfo, sizeof(HANDLE_INFO) );
+
 				char szFileName[MAX_PATH]    = {0},
 					 szProcessName[MAX_PATH] = {0};
 
-				CanonicalizeNtPathName( pThreadCtx->szFileName, szFileName );
-				CanonicalizeNtPathName( szNTProcessName, szProcessName );
+				CanonicalizeNtPathName( pThreadCtx->szFileName, hInfo.szFileName );
+				CanonicalizeNtPathName( szNTProcessName, hInfo.szProcessName );
 
-				printf( "File : %s Pid : %d (%s)\n", szFileName, ProcessId, szProcessName );
+				hInfo.ProcessId  = ProcessId;
+				hInfo.FileHandle = (HANDLE)SystemHandle.Handle;
+
+				//printf( "File : %s Pid : %d (%s)\n", szFileName, ProcessId, szProcessName );
+
+				HandlesList.push_back(hInfo);
 			}
 
 			CloseHandle(hThread);
@@ -504,6 +522,60 @@ end:
 	{
 		VirtualFree( SystemHandleInfo, SystemInfoLength, MEM_RELEASE );
 	}
+}
+
+BOOLEAN UnlockHandle( HANDLE_INFO Handle )
+{
+	HANDLE   hProcess;
+	HANDLE   dupHandle;
+	NTSTATUS status;
+
+
+	hProcess = OpenProcess( PROCESS_DUP_HANDLE, TRUE, Handle.ProcessId );
+	if( hProcess )
+	{
+		status = DuplicateHandle( hProcess, Handle.FileHandle, GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_CLOSE_SOURCE );
+		if( !NT_SUCCESS(status) )
+		{
+			printf( "[ERROR] : DuplicateHandle fails : 0x%08X\n", status );
+
+			return FALSE;
+		}
+
+		CloseHandle( dupHandle );
+		CloseHandle( hProcess );
+
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+void main( int argc, char **argv )
+{
+	vector<HANDLE_INFO> HandlesList;
+	vector<HANDLE_INFO>::iterator i, end; 
+
+	SetDebugPrivilege(TRUE);
+
+	printf( "# Gathering all handles.\n" );
+
+	GetSystemHandles( HandlesList );
+
+	for( i = HandlesList.begin(), end = HandlesList.end(); i != end; i++ )
+	{
+		printf( "[-] File : %s Pid : %d (%s)\n", i->szFileName, i->ProcessId, i->szProcessName );
+
+
+		/*if( stricmp( "C:\\Program Files (x86)\\Avetix\\db\\aspdb.avx", i->szFileName ) == 0 )
+		{
+			printf( "[-] UNLOCK File : %s Pid : %d (%s)\n", i->szFileName, i->ProcessId, i->szProcessName ); 
+			UnlockHandle( *i );
+		}*/
+	}
+
+	printf( "# Total handles retrieved : %d\n", HandlesList.size() );
+
 
 	return;
 }
